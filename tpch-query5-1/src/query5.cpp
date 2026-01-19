@@ -9,6 +9,7 @@
 #include <vector>
 #include <unordered_map>
 #include <iomanip>
+#include <chrono>
 
 // Function to parse command line arguments
 bool parseArgs(int argc, char* argv[], std::string& r_name, std::string& start_date, std::string& end_date, int& num_threads, std::string& table_path, std::string& result_path) {
@@ -57,12 +58,25 @@ bool readTPCHData(const std::string& table_path,
                   std::vector<std::map<std::string, std::string>>& nation_data, 
                   std::vector<std::map<std::string, std::string>>& region_data) {
 
-    auto readTable = [&](const std::string& filename, const std::vector<std::string>& headers, std::vector<std::map<std::string, std::string>>& data) -> bool {
+    std::cout << "Loading data tables..." << std::endl;
+    auto start_load = std::chrono::high_resolution_clock::now();
+
+    // Mutex not strictly needed if we write to different vectors, but let's be safe if we shared anything. 
+    // Here each thread writes to a distinct reference.
+    std::atomic<bool> success(true);
+
+    auto readTable = [&](const std::string& filename, const std::vector<std::string>& headers, std::vector<std::map<std::string, std::string>>& data) {
         std::ifstream file(table_path + "/" + filename);
         if (!file.is_open()) {
             std::cerr << "Error opening file: " << table_path + "/" + filename << std::endl;
-            return false;
+            success = false;
+            return;
         }
+        
+        // Reserve some memory to reduce reallocations. 
+        // We don't know line count, but for big tables it helps to start big if we could.
+        // For now, standard push_back.
+        
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty()) continue;
@@ -70,36 +84,38 @@ bool readTPCHData(const std::string& table_path,
             if (values.size() < headers.size()) continue; 
             std::map<std::string, std::string> row;
             for (size_t i = 0; i < headers.size(); ++i) {
-                row[headers[i]] = values[i];
+                row[headers[i]] = std::move(values[i]);
             }
-            data.push_back(row);
+            data.push_back(std::move(row));
         }
-        return true;
     };
 
-    // Headers mapped roughly to TPC-H schema positions we care about, or full schema
-    // Assuming schema is standard TPC-H. 
-    // We only need specific columns for query 5, but the signature implies reading everything or at least populating maps.
+    // Parallelize reading of independent tables
+    // Lineitem is the largest, then Orders, Customer. 
+    // Supplier, Nation, Region are small.
     
-    // CUSTOMER
-    if (!readTable("customer.tbl", {"c_custkey", "c_name", "c_address", "c_nationkey", "c_phone", "c_acctbal", "c_mktsegment", "c_comment"}, customer_data)) return false;
+    std::thread t_lineitem([&](){ readTable("lineitem.tbl", {"l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment"}, lineitem_data); });
+    std::thread t_orders([&](){ readTable("orders.tbl", {"o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment"}, orders_data); });
+    std::thread t_customer([&](){ readTable("customer.tbl", {"c_custkey", "c_name", "c_address", "c_nationkey", "c_phone", "c_acctbal", "c_mktsegment", "c_comment"}, customer_data); });
+    std::thread t_supplier([&](){ readTable("supplier.tbl", {"s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment"}, supplier_data); });
     
-    // ORDERS
-    if (!readTable("orders.tbl", {"o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority", "o_comment"}, orders_data)) return false;
+    // Tiny tables, read in main thread or another thread
+    std::thread t_others([&](){
+        readTable("nation.tbl", {"n_nationkey", "n_name", "n_regionkey", "n_comment"}, nation_data);
+        readTable("region.tbl", {"r_regionkey", "r_name", "r_comment"}, region_data);
+    });
 
-    // LINEITEM
-    if (!readTable("lineitem.tbl", {"l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity", "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment"}, lineitem_data)) return false;
+    t_lineitem.join();
+    t_orders.join();
+    t_customer.join();
+    t_supplier.join();
+    t_others.join();
 
-    // SUPPLIER
-    if (!readTable("supplier.tbl", {"s_suppkey", "s_name", "s_address", "s_nationkey", "s_phone", "s_acctbal", "s_comment"}, supplier_data)) return false;
+    auto end_load = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_load - start_load;
+    std::cout << "Data loading completed in " << duration.count() << " seconds." << std::endl;
 
-    // NATION
-    if (!readTable("nation.tbl", {"n_nationkey", "n_name", "n_regionkey", "n_comment"}, nation_data)) return false;
-
-    // REGION
-    if (!readTable("region.tbl", {"r_regionkey", "r_name", "r_comment"}, region_data)) return false;
-
-    return true;
+    return success;
 }
 
 // Function to execute TPCH Query 5 using multithreading
@@ -111,6 +127,9 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
                    const std::vector<std::map<std::string, std::string>>& nation_data, 
                    const std::vector<std::map<std::string, std::string>>& region_data, 
                    std::map<std::string, double>& results) {
+
+    std::cout << "Executing Query 5 with " << num_threads << " threads..." << std::endl;
+    auto start_query = std::chrono::high_resolution_clock::now();
 
     // 1. Filter Regions (Single Threaded - Small Dataset)
     std::unordered_map<std::string, std::string> region_keys; // r_regionkey -> r_name
@@ -151,13 +170,11 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
 
     // 5. Filter Orders by Date and relevant Customers (Multithreaded - data size ~1.5M)
     std::unordered_map<std::string, std::string> valid_orders; // o_orderkey -> o_custkey
-    // Optimization: Pre-reserve map size typically 1/5th to 1/2 of total orders depending on date range
-    valid_orders.reserve(orders_data.size() / 5);
-    
-    // We use a mutex to protect the shared map, or merge thread-local maps.
-    // Given the high contention if we write to one map, thread-local is better.
-    std::vector<std::unordered_map<std::string, std::string>> thread_orders(num_threads);
     std::vector<std::thread> order_threads;
+    std::vector<std::unordered_map<std::string, std::string>> thread_orders(num_threads);
+    // Reserve to avoid rehash
+    valid_orders.reserve(orders_data.size() / 5); 
+
     size_t order_chunk_size = (orders_data.size() + num_threads - 1) / num_threads;
 
     auto order_worker = [&](int thread_id, size_t start_idx, size_t end_idx) {
@@ -201,7 +218,6 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
             const auto& l = lineitem_data[i];
             
             // Check if order is valid (filtering using the pre-computed hash map)
-            // Using find is O(1)
             auto o_it = valid_orders.find(l.at("l_orderkey"));
             if (o_it != valid_orders.end()) {
                 // Check if supplier is valid
@@ -243,6 +259,10 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
             results[pair.first] += pair.second;
         }
     }
+
+    auto end_query = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> query_duration = end_query - start_query;
+    std::cout << "Query execution completed in " << query_duration.count() << " seconds." << std::endl;
 
     return true;
 }
