@@ -112,7 +112,7 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
                    const std::vector<std::map<std::string, std::string>>& region_data, 
                    std::map<std::string, double>& results) {
 
-    // 1. Filter Regions
+    // 1. Filter Regions (Single Threaded - Small Dataset)
     std::unordered_map<std::string, std::string> region_keys; // r_regionkey -> r_name
     for (const auto& r : region_data) {
         if (r.at("r_name") == r_name) {
@@ -122,7 +122,7 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
 
     if (region_keys.empty()) return true;
 
-    // 2. Filter Nations in those regions
+    // 2. Filter Nations in those regions (Single Threaded - Small Dataset)
     std::unordered_map<std::string, std::string> nation_keys; // n_nationkey -> n_name
     for (const auto& n : nation_data) {
         if (region_keys.count(n.at("n_regionkey"))) {
@@ -132,7 +132,7 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
 
     if (nation_keys.empty()) return true;
 
-    // 3. Filter Suppliers in those nations
+    // 3. Filter Suppliers in those nations (Single Threaded - Small Dataset)
     std::unordered_map<std::string, std::string> supplier_nation_map; // s_suppkey -> s_nationkey
     for (const auto& s : supplier_data) {
         if (nation_keys.count(s.at("s_nationkey"))) {
@@ -140,7 +140,7 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
         }
     }
 
-    // 4. Filter Customers in those nations
+    // 4. Filter Customers in those nations (Single Threaded - data size ~150k is manageable)
     // Note: c_nationkey = s_nationkey is a join condition later, but efficient lookup helps
     std::unordered_map<std::string, std::string> customer_nation_map; // c_custkey -> c_nationkey
     for (const auto& c : customer_data) {
@@ -149,19 +149,49 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
         }
     }
 
-    // 5. Filter Orders by Date and relevant Customers
+    // 5. Filter Orders by Date and relevant Customers (Multithreaded - data size ~1.5M)
     std::unordered_map<std::string, std::string> valid_orders; // o_orderkey -> o_custkey
-    for (const auto& o : orders_data) {
-        const std::string& o_date = o.at("o_orderdate");
-        if (o_date >= start_date && o_date < end_date) {
-            std::string cust_key = o.at("o_custkey");
-            if (customer_nation_map.count(cust_key)) {
-                valid_orders[o.at("o_orderkey")] = cust_key;
+    // Optimization: Pre-reserve map size typically 1/5th to 1/2 of total orders depending on date range
+    valid_orders.reserve(orders_data.size() / 5);
+    
+    // We use a mutex to protect the shared map, or merge thread-local maps.
+    // Given the high contention if we write to one map, thread-local is better.
+    std::vector<std::unordered_map<std::string, std::string>> thread_orders(num_threads);
+    std::vector<std::thread> order_threads;
+    size_t order_chunk_size = (orders_data.size() + num_threads - 1) / num_threads;
+
+    auto order_worker = [&](int thread_id, size_t start_idx, size_t end_idx) {
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            const auto& o = orders_data[i];
+            const std::string& o_date = o.at("o_orderdate");
+            if (o_date >= start_date && o_date < end_date) {
+                std::string cust_key = o.at("o_custkey");
+                // Check if customer is in the valid nation set
+                if (customer_nation_map.count(cust_key)) {
+                    thread_orders[thread_id][o.at("o_orderkey")] = cust_key;
+                }
             }
+        }
+    };
+
+    for (int i = 0; i < num_threads; ++i) {
+        size_t start = i * order_chunk_size;
+        size_t end = std::min(start + order_chunk_size, orders_data.size());
+        if (start < end) {
+            order_threads.emplace_back(order_worker, i, start, end);
         }
     }
 
-    // 6. Process Lineitems (Multithreaded)
+    for (auto& t : order_threads) {
+        if (t.joinable()) t.join();
+    }
+
+    // Merge valid orders
+    for (const auto& local_map : thread_orders) {
+        valid_orders.insert(local_map.begin(), local_map.end());
+    }
+
+    // 6. Process Lineitems (Multithreaded - data size ~6M)
     std::vector<std::thread> threads;
     std::vector<std::map<std::string, double>> thread_results(num_threads);
     size_t chunk_size = (lineitem_data.size() + num_threads - 1) / num_threads;
@@ -169,15 +199,13 @@ bool executeQuery5(const std::string& r_name, const std::string& start_date, con
     auto worker = [&](int thread_id, size_t start_idx, size_t end_idx) {
         for (size_t i = start_idx; i < end_idx; ++i) {
             const auto& l = lineitem_data[i];
-            std::string order_key = l.at("l_orderkey");
             
-            // Check if order is valid
-            auto o_it = valid_orders.find(order_key);
+            // Check if order is valid (filtering using the pre-computed hash map)
+            // Using find is O(1)
+            auto o_it = valid_orders.find(l.at("l_orderkey"));
             if (o_it != valid_orders.end()) {
-                std::string supp_key = l.at("l_suppkey");
-                
                 // Check if supplier is valid
-                auto s_it = supplier_nation_map.find(supp_key);
+                auto s_it = supplier_nation_map.find(l.at("l_suppkey"));
                 if (s_it != supplier_nation_map.end()) {
                     std::string cust_key = o_it->second;
                     std::string cust_nation = customer_nation_map.at(cust_key);
